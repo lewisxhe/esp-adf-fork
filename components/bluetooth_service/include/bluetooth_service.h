@@ -187,6 +187,37 @@ esp_err_t periph_bluetooth_rewind(esp_periph_handle_t periph);
 esp_err_t periph_bluetooth_fast_forward(esp_periph_handle_t periph);
 
 /**
+ * @brief      Send a volume up command to a Bluetooth device
+ *
+ * @param[in]  periph  The periph
+ *
+ * @return
+ *     - ESP_OK
+ *     - ESP_FAIL
+ */
+esp_err_t periph_bluetooth_volume_up(esp_periph_handle_t periph);
+
+/**
+ * @brief      Send a volume down command to a Bluetooth device
+ *
+ * @param[in]  periph  The periph
+ *
+ * @return
+ *     - ESP_OK
+ *     - ESP_FAIL
+ */
+esp_err_t periph_bluetooth_volume_down(esp_periph_handle_t periph);
+
+/**
+ * @brief      Get the volume level of the Bluetooth device
+ *
+ * @param[in]  periph  The periph
+ *
+ * @return 0 ~ 100 %
+ *     
+ */
+uint8_t periph_bluetooth_get_volume();
+/**
  * @brief      Start device discovery.
  *
  * @param[in]  periph  The periph

@@ -46,6 +46,7 @@
 #include "bluetooth_service.h"
 #include "bt_keycontrol.h"
 
+#define BT_RC_TG_TAG    "RC_TG"
 static const char *TAG = "BLUETOOTH_SERVICE";
 
 #define BT_SOURCE_DEFAULT_REMOTE_NAME "ESP-ADF-SPEAKER"
@@ -99,6 +100,11 @@ static const char *audio_state_str[] = { "Suspended", "Stopped", "Started" };
 #if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 0, 0))
 static esp_avrc_rn_evt_cap_mask_t s_avrc_peer_rn_cap;
 #endif
+
+static _lock_t s_volume_lock;
+static uint8_t s_volume = 0;                 /* local volume value */
+static bool s_volume_notify;                 /* notify volume change or not */
+
 
 static void bt_av_new_track(void)
 {
@@ -162,6 +168,33 @@ static void bt_av_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t *even
     }
 }
 #endif
+
+
+static void volume_set_by_controller(uint8_t volume)
+{
+    ESP_LOGI(BT_RC_TG_TAG, "Volume is set by remote controller to: %"PRIu32"%%", (uint32_t)volume * 100 / 0x7f);
+    /* set the volume in protection of lock */
+    _lock_acquire(&s_volume_lock);
+    s_volume = volume;
+    _lock_release(&s_volume_lock);
+}
+
+static void volume_set_by_local_host(uint8_t volume)
+{
+    ESP_LOGI(BT_RC_TG_TAG, "Volume is set locally to: %"PRIu32"%%", (uint32_t)volume * 100 / 0x7f);
+    /* set the volume in protection of lock */
+    _lock_acquire(&s_volume_lock);
+    s_volume = volume;
+    _lock_release(&s_volume_lock);
+
+    /* send notification response to remote AVRCP controller */
+    if (s_volume_notify) {
+        esp_avrc_rn_param_t rn_param;
+        rn_param.volume = s_volume;
+        esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE, ESP_AVRC_RN_RSP_CHANGED, &rn_param);
+        s_volume_notify = false;
+    }
+}
 
 static void bt_a2d_sink_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p_param)
 {
@@ -461,6 +494,62 @@ static void bt_avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *
     }
 }
 
+
+static void bt_app_rc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *p_param)
+{
+    ESP_LOGD(BT_RC_TG_TAG, "%s event: %d", __func__, event);
+
+    esp_avrc_tg_cb_param_t *rc = (esp_avrc_tg_cb_param_t *)(p_param);
+
+    switch (event) {
+    /* when connection state changed, this event comes */
+    case ESP_AVRC_TG_CONNECTION_STATE_EVT: {
+        uint8_t *bda = rc->conn_stat.remote_bda;
+        ESP_LOGI(BT_RC_TG_TAG, "AVRC conn_state evt: state %d, [%02x:%02x:%02x:%02x:%02x:%02x]",
+                 rc->conn_stat.connected, bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+        if (rc->conn_stat.connected) {
+            /* create task to simulate volume change */
+            // xTaskCreate(volume_change_simulation, "vcsTask", 2048, NULL, 5, &s_vcs_task_hdl);
+        } else {
+            // vTaskDelete(s_vcs_task_hdl);
+            ESP_LOGI(BT_RC_TG_TAG, "Stop volume change simulation");
+        }
+        break;
+    }
+    /* when passthrough commanded, this event comes */
+    case ESP_AVRC_TG_PASSTHROUGH_CMD_EVT: {
+        ESP_LOGI(BT_RC_TG_TAG, "AVRC passthrough cmd: key_code 0x%x, key_state %d", rc->psth_cmd.key_code, rc->psth_cmd.key_state);
+        break;
+    }
+    /* when absolute volume command from remote device set, this event comes */
+    case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT: {
+        ESP_LOGI(BT_RC_TG_TAG, "AVRC set absolute volume: %d%%", (int)rc->set_abs_vol.volume * 100 / 0x7f);
+        volume_set_by_controller(rc->set_abs_vol.volume);
+        break;
+    }
+    /* when notification registered, this event comes */
+    case ESP_AVRC_TG_REGISTER_NOTIFICATION_EVT: {
+        ESP_LOGI(BT_RC_TG_TAG, "AVRC register event notification: %d, param: 0x%"PRIx32, rc->reg_ntf.event_id, rc->reg_ntf.event_parameter);
+        if (rc->reg_ntf.event_id == ESP_AVRC_RN_VOLUME_CHANGE) {
+            s_volume_notify = true;
+            esp_avrc_rn_param_t rn_param;
+            rn_param.volume = s_volume;
+            esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE, ESP_AVRC_RN_RSP_INTERIM, &rn_param);
+        }
+        break;
+    }
+    /* when feature of remote device indicated, this event comes */
+    case ESP_AVRC_TG_REMOTE_FEATURES_EVT: {
+        ESP_LOGI(BT_RC_TG_TAG, "AVRC remote features: %"PRIx32", CT features: %x", rc->rmt_feats.feat_mask, rc->rmt_feats.ct_feat_flag);
+        break;
+    }
+    /* others */
+    default:
+        ESP_LOGE(BT_RC_TG_TAG, "%s unhandled event: %d", __func__, event);
+        break;
+    }
+}
+
 static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 {
     switch (event) {
@@ -491,7 +580,7 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
         case ESP_BT_GAP_AUTH_CMPL_EVT: {
                 if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
                     ESP_LOGI(TAG, "authentication success: %s", param->auth_cmpl.device_name);
-                    esp_log_buffer_hex(TAG, param->auth_cmpl.bda, ESP_BD_ADDR_LEN);
+                    ESP_LOG_BUFFER_HEX(TAG, param->auth_cmpl.bda, ESP_BD_ADDR_LEN);
                 } else {
                     ESP_LOGI(TAG, "authentication failed, status:%d", param->auth_cmpl.stat);
                 }
@@ -614,17 +703,20 @@ esp_err_t bluetooth_service_start(bluetooth_service_cfg_t *config)
     }
 
     if (config->device_name) {
-        esp_bt_dev_set_device_name(config->device_name);
+        esp_bt_gap_set_device_name(config->device_name);
     } else {
         if (config->mode == BLUETOOTH_A2DP_SINK) {
-            esp_bt_dev_set_device_name("ESP-ADF-SPEAKER");
+            esp_bt_gap_set_device_name("ESP-ADF-SPEAKER");
         } else {
-            esp_bt_dev_set_device_name("ESP-ADF-SOURCE");
+            esp_bt_gap_set_device_name("ESP-ADF-SOURCE");
         }
     }
 
     esp_avrc_ct_init();
     esp_avrc_ct_register_callback(bt_avrc_ct_cb);
+
+    esp_avrc_tg_init();
+    esp_avrc_tg_register_callback(bt_app_rc_tg_cb);
 
     if (config->mode == BLUETOOTH_A2DP_SINK) {
 #if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 0, 0))
@@ -832,6 +924,25 @@ esp_err_t periph_bluetooth_rewind(esp_periph_handle_t periph)
 esp_err_t periph_bluetooth_fast_forward(esp_periph_handle_t periph)
 {
     return periph_bluetooth_passthrough_cmd(periph, ESP_AVRC_PT_CMD_FAST_FORWARD);
+}
+
+esp_err_t periph_bluetooth_volume_up(esp_periph_handle_t periph)
+{
+    // return periph_bluetooth_passthrough_cmd(periph, ESP_AVRC_PT_CMD_VOL_UP);
+    volume_set_by_local_host(s_volume+5);
+    return ESP_OK;
+}
+
+esp_err_t periph_bluetooth_volume_down(esp_periph_handle_t periph)
+{
+    // return periph_bluetooth_passthrough_cmd(periph, ESP_AVRC_PT_CMD_VOL_DOWN);
+     volume_set_by_local_host(s_volume-5);
+     return ESP_OK;
+}
+
+uint8_t periph_bluetooth_get_volume()
+{
+    return s_volume;
 }
 
 esp_err_t periph_bluetooth_discover(esp_periph_handle_t periph)
